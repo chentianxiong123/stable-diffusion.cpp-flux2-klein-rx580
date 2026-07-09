@@ -1,4 +1,4 @@
-set(TARGET sd-cli)
+set(TARGET stable-diffusion.cpp-flux2-klein-rx580)
 
 add_executable(${TARGET}
     ../common/common.cpp

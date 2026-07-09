@@ -227,6 +227,7 @@ typedef struct {
     bool auto_fit;
     const char* rpc_servers;
     const char* model_args;
+    int version_override;  // SDVersion override when no diffusion model loaded (-1 = auto)
 } sd_ctx_params_t;
 
 typedef struct {
@@ -382,6 +383,16 @@ typedef struct {
     int qwen_image_layers;
     bool circular_x;
     bool circular_y;
+    const char* embeddings_cache_dir;
+    const char* latent_cache_dir;
+    const char* ref_latents_cache_dir;
+    const char* stage;
+    int resume_step;
+    const char* vision_model;
+    const char* vision_out;
+    const char* llm_out;
+    const char* vae_out;
+    const char* diffuse_out;
 } sd_img_gen_params_t;
 
 typedef struct {

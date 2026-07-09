@@ -80,6 +80,7 @@ namespace LLM {
         int num_position_embeddings         = 0;
         std::set<int> fullatt_block_indexes = {7, 15, 23, 31};
         bool split_patch_embed              = false;
+        bool mmproj_style                   = false;  // llama.cpp mmproj naming convention
     };
 
     struct LLMConfig {
@@ -222,6 +223,48 @@ namespace LLM {
                     }
                     if (contains(name, "visual.merger.linear_fc2.weight") ||
                         contains(name, "visual.merger.mlp.2.weight")) {
+                        config.vision.out_hidden_size = tensor_storage.ne[1];
+                    }
+                    continue;
+                }
+                // llama.cpp mmproj naming convention (v. prefix)
+                std::string after_prefix = name.substr(prefix.size());
+                // after_prefix has a leading dot because prefix has no trailing dot
+                // e.g. ".visual.v.blk.0.attn_qkv.bias"
+                if (after_prefix.size() > 0 && after_prefix[0] == '.') {
+                    after_prefix = after_prefix.substr(1);
+                }
+                if (starts_with(after_prefix, "v.") || starts_with(after_prefix, "visual.v.") || starts_with(after_prefix, "visual.mm.")) {
+                    config.vision.mmproj_style = true;
+                    config.have_vision_weight = true;
+                    if (contains(name, "v.patch_embd.weight")) {
+                        config.vision.split_patch_embed = true;
+                        config.vision.patch_size  = static_cast<int>(tensor_storage.ne[0]);
+                        config.vision.in_channels = tensor_storage.ne[2];
+                        config.vision.hidden_size = tensor_storage.ne[3];
+                    }
+                    if (contains(name, "v.position_embd.weight")) {
+                        config.vision.hidden_size             = tensor_storage.ne[0];
+                        config.vision.num_position_embeddings = static_cast<int>(tensor_storage.ne[1]);
+                    }
+                    if (contains(name, "v.blk.")) {
+                        auto items = split_string(after_prefix, '.');
+                        // after_prefix is like "visual.v.blk.N..." or "v.blk.N..."
+                        // Find the numeric index after "blk"
+                        for (size_t ii = 0; ii + 1 < items.size(); ii++) {
+                            if (items[ii] == "blk") {
+                                int block_index = atoi(items[ii + 1].c_str());
+                                if (block_index + 1 > detected_vision_layers) {
+                                    detected_vision_layers = block_index + 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if (contains(name, "v.blk.0.ffn_up.weight")) {
+                        config.vision.intermediate_size = tensor_storage.ne[1];
+                    }
+                    if (contains(name, "mm.0.weight")) {
                         config.vision.out_hidden_size = tensor_storage.ne[1];
                     }
                     continue;
@@ -504,6 +547,21 @@ namespace LLM {
         }
 
         GGML_ASSERT(x->ne[2] == 1);  // N == 1
+        const int64_t raw_n_tokens = x->ne[1];
+        for (size_t i = 0; i < image_embeds.size(); i++) {
+            const int idx       = image_embeds[i].first;
+            ggml_tensor* embed  = image_embeds[i].second;
+            const int64_t count = embed != nullptr ? embed->ne[1] : -1;
+            GGML_ASSERT(idx >= 0);
+            GGML_ASSERT(embed != nullptr);
+            GGML_ASSERT(count >= 0);
+            GGML_ASSERT(static_cast<int64_t>(idx) + count <= raw_n_tokens);
+            if (i > 0) {
+                const int prev_idx     = image_embeds[i - 1].first;
+                const int64_t prev_len = image_embeds[i - 1].second->ne[1];
+                GGML_ASSERT(static_cast<int64_t>(prev_idx) + prev_len <= idx);
+            }
+        }
 
         auto raw_x               = ggml_cast(ctx->ggml_ctx, x, image_embeds[0].second->type);
         int64_t txt_token_start  = 0;
@@ -1416,6 +1474,66 @@ namespace LLM {
         std::array<std::vector<int32_t>, 4> pos_embed_idx_data_;
         std::array<std::vector<float>, 4> pos_embed_weight_data_;
 
+        // ── string replace helper ──
+        static void mmproj_replace(std::string& s, const std::string& from, const std::string& to) {
+            size_t pos = 0;
+            while ((pos = s.find(from, pos)) != std::string::npos) {
+                s.replace(pos, from.length(), to);
+                pos += to.length();
+            }
+        }
+
+        // ── mmproj → standard name remapping ──
+        static std::string mmproj_to_standard_name(const std::string& name) {
+            std::string r = name;
+            mmproj_replace(r, ".patch_embd.weight.1", ".patch_embed.proj.1.weight");
+            mmproj_replace(r, ".patch_embd.weight", ".patch_embed.proj.0.weight");
+            mmproj_replace(r, ".patch_embd.bias", ".patch_embed.bias");
+            mmproj_replace(r, ".position_embd.weight", ".pos_embed.weight");
+            mmproj_replace(r, ".v.blk.", ".blocks.");
+            mmproj_replace(r, "attn_qkv", "attn.qkv");
+            mmproj_replace(r, "attn_out", "attn.proj");
+            mmproj_replace(r, "ffn_up", "mlp.linear_fc1");
+            mmproj_replace(r, "ffn_down", "mlp.linear_fc2");
+            mmproj_replace(r, ".ln1.", ".norm1.");
+            mmproj_replace(r, ".ln2.", ".norm2.");
+            mmproj_replace(r, "post_ln", "merger.norm");
+            mmproj_replace(r, "mm.0", "merger.linear_fc1");
+            mmproj_replace(r, "mm.2", "merger.linear_fc2");
+            if (starts_with(r, "v.")) r = r.substr(2);
+            if (starts_with(r, "mm.")) r = "merger." + r;
+            return r;
+        }
+
+        static std::string standard_to_mmproj_name(const std::string& name) {
+            std::string r = name;
+            mmproj_replace(r, ".patch_embed.proj.1.weight", ".patch_embd.weight.1");
+            mmproj_replace(r, ".patch_embed.proj.0.weight", ".patch_embd.weight");
+            mmproj_replace(r, ".patch_embed.weight.1", ".patch_embd.weight.1");
+            mmproj_replace(r, ".patch_embed.weight", ".patch_embd.weight");
+            mmproj_replace(r, ".patch_embed.bias", ".patch_embd.bias");
+            mmproj_replace(r, ".pos_embed.weight", ".position_embd.weight");
+            mmproj_replace(r, ".blocks.", ".v.blk.");
+            mmproj_replace(r, ".attn.qkv.", ".attn_qkv.");
+            mmproj_replace(r, ".attn.proj.", ".attn_out.");
+            mmproj_replace(r, "mlp.linear_fc1", "ffn_up");
+            mmproj_replace(r, "mlp.linear_fc2", "ffn_down");
+            mmproj_replace(r, ".norm1.", ".ln1.");
+            mmproj_replace(r, ".norm2.", ".ln2.");
+            mmproj_replace(r, "merger.norm", "post_ln");
+            mmproj_replace(r, "merger.linear_fc1", "mm.0");
+            mmproj_replace(r, "merger.linear_fc2", "mm.2");
+            return r;
+        }
+
+        static String2TensorStorage remap_tensor_storage(const String2TensorStorage& original) {
+            String2TensorStorage remapped;
+            for (const auto& [name, storage] : original) {
+                remapped[mmproj_to_standard_name(name)] = storage;
+            }
+            return remapped;
+        }
+
         static ggml_tensor* process_image_common(ggml_context* ctx,
                                                  ggml_tensor* image,
                                                  const LLMVisionConfig& vision_params) {
@@ -1454,7 +1572,10 @@ namespace LLM {
                                                           std::array<std::vector<int32_t>, 4>& pos_embed_idx_data,
                                                           std::array<std::vector<float>, 4>& pos_embed_weight_data) {
             auto pos_embed = vision->pos_embedder();
-            GGML_ASSERT(pos_embed != nullptr);
+            if (pos_embed == nullptr) {
+                LOG_WARN("pos_embed not found in vision model, skipping learned position embeddings");
+                return nullptr;
+            }
             for (int i = 0; i < 4; ++i) {
                 pos_embed_idx_data[i].clear();
                 pos_embed_weight_data[i].clear();
@@ -1642,7 +1763,12 @@ namespace LLM {
                 }
             }
             model = LLM(config, enable_vision, config.llama_cpp_style);
-            model.init(params_ctx, tensor_storage_map, prefix);
+            if (config.vision.mmproj_style) {
+                auto remapped = remap_tensor_storage(tensor_storage_map);
+                model.init(params_ctx, remapped, prefix);
+            } else {
+                model.init(params_ctx, tensor_storage_map, prefix);
+            }
         }
 
         std::string get_desc() override {
@@ -1651,6 +1777,25 @@ namespace LLM {
 
         void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors, const std::string prefix) {
             model.get_param_tensors(tensors, prefix);
+            // Check if vision tensor names use standard naming that should be remapped to mmproj.
+            // Standard names have "visual.blocks.N" while mmproj has "visual.v.blk.N".
+            // The original tensor_storage was remapped to standard during init, but registration
+            // must use mmproj names so the model manager finds them in the (unmapped) storage map.
+            bool needs_remap = false;
+            for (const auto& [name, _] : tensors) {
+                if (name.find(".visual.") != std::string::npos &&
+                    name.find(".blocks.") != std::string::npos) {
+                    needs_remap = true;
+                    break;
+                }
+            }
+            if (needs_remap) {
+                std::map<std::string, ggml_tensor*> remapped;
+                for (auto& [name, tensor] : tensors) {
+                    remapped[standard_to_mmproj_name(name)] = tensor;
+                }
+                tensors = std::move(remapped);
+            }
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -1698,6 +1843,15 @@ namespace LLM {
             }
 
             int64_t n_tokens = input_ids->ne[0];
+            for (const auto& [idx, embed] : image_embeds) {
+                GGML_ASSERT(idx >= 0);
+                GGML_ASSERT(embed->ne[1] >= 0);
+                GGML_ASSERT(static_cast<int64_t>(idx) + embed->ne[1] <= n_tokens);
+            }
+            if (!attention_mask_tensor.empty()) {
+                GGML_ASSERT(attention_mask_tensor.numel() == n_tokens * n_tokens);
+            }
+
             if (config.arch == LLMArch::MISTRAL_SMALL_3_2 ||
                 config.arch == LLMArch::MINISTRAL_3_3B ||
                 config.arch == LLMArch::QWEN3 ||
@@ -1797,8 +1951,8 @@ namespace LLM {
                                    out_layers,
                                    return_all_hidden_states);
             };
-            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params),
-                                                   input_ids.dim() + 1);
+            auto output = GGMLRunner::compute<float>(get_graph, n_threads, auto_free, free_compute_buffer, free_compute_params);
+            return restore_trailing_singleton_dims(std::move(output), input_ids.dim() + 1);
         }
 
         int64_t get_num_image_tokens(int64_t t, int64_t h, int64_t w) {

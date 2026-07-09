@@ -15,6 +15,7 @@
 
 // #include "preprocessing.hpp"
 #include "stable-diffusion.h"
+#include "model.h"
 
 #include "common/common.h"
 #include "common/media_io.h"
@@ -779,6 +780,41 @@ int main(int argc, const char* argv[]) {
 
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(cli_params.taesd_preview);
 
+    // Stage: only load necessary models. Atomic stages are executed one at a
+    // time by generate_image(); comma-separated stage lists are rejected there.
+    const std::string& stage = gen_params.stage;
+
+    auto stage_is = [&stage](const std::string& name) -> bool { return stage == name; };
+    auto known_atomic_stage = [&stage_is]() -> bool {
+        return stage_is("llm_encode_vision") ||
+               stage_is("llm_encode_text") ||
+               stage_is("vae_encode") ||
+               stage_is("diffuse") ||
+               stage_is("vae_decode");
+    };
+
+    if (!stage.empty() && stage.find(',') != std::string::npos) {
+        LOG_ERROR("atomic stages must be invoked one at a time; run each --stage in a separate process");
+        return 1;
+    }
+    if (!stage.empty() && !known_atomic_stage()) {
+        LOG_ERROR("unknown stage: %s", stage.c_str());
+        return 1;
+    }
+
+    // Atomic pipeline stages
+    bool needs_diffusion   = stage.empty() || stage_is("diffuse");
+    bool needs_vae         = stage.empty() || stage_is("vae_encode") || stage_is("vae_decode");
+    bool needs_llm         = stage.empty() || stage_is("llm_encode_text") || stage_is("llm_encode_vision");
+    bool needs_vision      = stage_is("llm_encode_vision");
+    bool is_cache_stage    = stage_is("llm_encode_vision") ||
+                          stage_is("llm_encode_text") ||
+                          stage_is("vae_encode") ||
+                          stage_is("diffuse");
+
+    if (!needs_llm)       { sd_ctx_params.llm_path = nullptr; sd_ctx_params.llm_vision_path = nullptr; }
+    if (!needs_vision)    sd_ctx_params.llm_vision_path = nullptr;
+
     SDImageVec results;
     int num_results             = 0;
     sd_audio_t* generated_audio = nullptr;
@@ -810,11 +846,16 @@ int main(int argc, const char* argv[]) {
             sd_img_gen_params_t img_gen_params = gen_params.to_sd_img_gen_params_t();
 
             sd_image_t* generated_images = nullptr;
-            if (!generate_image(sd_ctx.get(), &img_gen_params, &generated_images, &num_results)) {
+            bool generation_ok = generate_image(sd_ctx.get(), &img_gen_params, &generated_images, &num_results);
+            if (!generation_ok) {
                 generated_images = nullptr;
                 num_results      = 0;
             }
             results.adopt(generated_images, num_results);
+            if (!generation_ok) {
+                LOG_ERROR("generate failed");
+                return 1;
+            }
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
             sd_image_t* generated_video        = nullptr;
@@ -825,8 +866,12 @@ int main(int argc, const char* argv[]) {
         }
 
         if (!results) {
-            LOG_ERROR("generate failed");
-            return 1;
+            // Stages that cache to disk (llm_encode_vision, llm_encode_text, vae_encode, diffuse)
+            // produce 0 output images — this is expected, not a failure.
+            if (!is_cache_stage) {
+                LOG_ERROR("generate failed");
+                return 1;
+            }
         }
     }
 
@@ -869,6 +914,10 @@ int main(int argc, const char* argv[]) {
                 results[i] = current_image.release();  // Set the final upscaled image as the result
             }
         }
+    }
+
+    if (!results && is_cache_stage) {
+        return 0;
     }
 
     if (!save_results(cli_params, ctx_params, gen_params, results.data(), num_results, generated_audio)) {

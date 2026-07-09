@@ -975,6 +975,61 @@ ArgOptions SDGenerationParams::get_options() {
          "extra VAE tiling args, key=value list. LTX video VAE supports temporal_tile_frames (default: 4), temporal_tile_overlap (default: 1)",
          (int)',',
          &extra_tiling_args},
+        {"",
+         "--stage",
+         "atomic stage to run, one process at a time: llm_encode_vision, llm_encode_text, vae_encode, diffuse, vae_decode",
+         0,
+         &stage},
+        {"",
+         "--save-embeddings",
+         "directory to save/load LLM text embeddings cache",
+         0,
+         &embeddings_cache_dir},
+        {"",
+         "--load-embeddings",
+         "alias for --save-embeddings",
+         0,
+         &embeddings_cache_dir},
+        {"",
+         "--save-ref-latents",
+         "directory to save/load reference image VAE latents cache",
+         0,
+         &ref_latents_cache_dir},
+        {"",
+         "--load-ref-latents",
+         "alias for --save-ref-latents",
+         0,
+         &ref_latents_cache_dir},
+        {"",
+         "--latent-cache-dir",
+         "directory for latent cache (init_latent, ref_latents, step checkpoints)",
+         0,
+         &latent_cache_dir},
+        {"",
+         "--vision-model",
+         "path to vision encoder model for llm_encode_vision",
+         0,
+         &vision_model},
+        {"",
+         "--vision-out",
+         "output directory for llm_encode_vision results (visual tokens)",
+         0,
+         &vision_out},
+        {"",
+         "--llm-out",
+         "output directory for llm_encode_text results (condition embeddings)",
+         0,
+         &llm_out},
+        {"",
+         "--vae-out",
+         "output directory for vae_encode results (ref latents)",
+         0,
+         &vae_out},
+        {"",
+         "--diffuse-out",
+         "output directory for diffuse results (final latents)",
+         0,
+         &diffuse_out},
     };
 
     options.int_options = {
@@ -1007,6 +1062,10 @@ ArgOptions SDGenerationParams::get_options() {
          "--qwen-image-layers",
          "number of Qwen Image Layered layers; latent/output count is layers + 1 (default: 3)",
          &qwen_image_layers},
+        {"",
+         "--resume-step",
+         "resume diffusion from this step (requires --latent-cache-dir with checkpoint files)",
+         &resume_step},
         {"",
          "--video-frames",
          "video frames (default: 1)",
@@ -2456,6 +2515,16 @@ sd_img_gen_params_t SDGenerationParams::to_sd_img_gen_params_t() {
     params.hires.custom_sigmas_count = static_cast<int>(hires_custom_sigmas.size());
     params.circular_x                = circular || circular_x;
     params.circular_y                = circular || circular_y;
+    params.embeddings_cache_dir      = embeddings_cache_dir.empty() ? nullptr : embeddings_cache_dir.c_str();
+    params.latent_cache_dir          = latent_cache_dir.empty() ? nullptr : latent_cache_dir.c_str();
+    params.ref_latents_cache_dir     = ref_latents_cache_dir.empty() ? nullptr : ref_latents_cache_dir.c_str();
+    params.resume_step               = resume_step;
+    params.stage                     = stage.empty() ? nullptr : stage.c_str();
+    params.vision_model              = vision_model.empty() ? nullptr : vision_model.c_str();
+    params.vision_out                = vision_out.empty() ? nullptr : vision_out.c_str();
+    params.llm_out                   = llm_out.empty() ? nullptr : llm_out.c_str();
+    params.vae_out                   = vae_out.empty() ? nullptr : vae_out.c_str();
+    params.diffuse_out               = diffuse_out.empty() ? nullptr : diffuse_out.c_str();
     return params;
 }
 

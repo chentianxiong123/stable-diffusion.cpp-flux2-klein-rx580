@@ -16,6 +16,7 @@ if (MSVC)
         $<$<COMPILE_LANGUAGE:C>:/utf-8>
         $<$<COMPILE_LANGUAGE:CXX>:/MP>
         $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+        $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
     )
 endif()
 

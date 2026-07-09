@@ -226,6 +226,17 @@ struct SDGenerationParams {
     float vace_strength                  = 1.f;
     sd_tiling_params_t vae_tiling_params = {false, false, 0, 0, 0.5f, 0.0f, 0.0f, nullptr};
     std::string extra_tiling_args;
+    // Pipeline stage & cache options
+    std::string stage;
+    std::string embeddings_cache_dir;
+    std::string latent_cache_dir;
+    std::string ref_latents_cache_dir;
+    int resume_step = -1;
+    std::string vision_model;
+    std::string vision_out;
+    std::string llm_out;
+    std::string vae_out;
+    std::string diffuse_out;
 
     std::string pm_id_images_dir;
     std::string pm_id_embed_path;

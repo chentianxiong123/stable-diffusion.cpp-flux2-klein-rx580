@@ -2,6 +2,7 @@
 #define __SD_CONDITIONING_CONDITIONER_HPP__
 
 #include <cmath>
+#include <algorithm>
 #include <limits>
 #include <optional>
 
@@ -1800,7 +1801,8 @@ struct LLMEmbedder : public Conditioner {
         } else if (sd_version_is_ideogram4(version) || sd_version_is_boogu_image(version) || sd_version_is_sefi_image(version) || sd_version_is_krea2(version)) {
             arch = LLM::LLMArch::QWEN3_VL;
         } else if (sd_version_is_z_image(version) || version == VERSION_OVIS_IMAGE || version == VERSION_FLUX2_KLEIN) {
-            arch = LLM::LLMArch::QWEN3;
+            arch = LLM::LLMArch::QWEN3_VL;
+            enable_vision = true;
         }
         if (arch == LLM::LLMArch::MISTRAL_SMALL_3_2 || arch == LLM::LLMArch::MINISTRAL_3_3B) {
             tokenizer = std::make_shared<MistralTokenizer>();
@@ -1993,6 +1995,124 @@ struct LLMEmbedder : public Conditioner {
         return new_hidden_states;
     }
 
+    // encode_vision: ref_image pixel data → visual tokens (image_embeds)
+    // This can be called standalone (cached) or as part of get_learned_condition
+    std::vector<std::pair<int, sd::Tensor<float>>>
+    encode_vision(int n_threads, const std::vector<sd::Tensor<float>>& ref_images) {
+        std::vector<std::pair<int, sd::Tensor<float>>> image_embeds;
+        if (!llm->enable_vision || ref_images.empty()) return image_embeds;
+
+        int image_embed_idx = 64 + 6;
+        int min_pixels = 384 * 384;
+        int max_pixels = 560 * 560;
+
+        for (int i = 0; i < (int)ref_images.size(); i++) {
+            const auto& image = ref_images[i];
+            double factor = llm->config.vision.patch_size * llm->config.vision.spatial_merge_size;
+            int height = (int)image.shape()[1];
+            int width  = (int)image.shape()[0];
+            int h_bar = (int)(round(height / factor) * factor);
+            int w_bar = (int)(round(width / factor) * factor);
+
+            if (h_bar * w_bar > max_pixels) {
+                double beta = sqrt((height * width) / (double)max_pixels);
+                h_bar = std::max((int)factor, (int)(floor(height / beta / factor)) * (int)factor);
+                w_bar = std::max((int)factor, (int)(floor(width / beta / factor)) * (int)factor);
+            } else if (h_bar * w_bar < min_pixels) {
+                double beta = sqrt((double)min_pixels / (height * width));
+                h_bar = (int)(ceil(height * beta / factor)) * (int)factor;
+                w_bar = (int)(ceil(width * beta / factor)) * (int)factor;
+            }
+
+            auto resized = clip_preprocess(image, w_bar, h_bar);
+            auto embed   = llm->encode_image(n_threads, resized, false, true, true);
+            GGML_ASSERT(!embed.empty());
+            image_embeds.emplace_back(image_embed_idx, embed);
+            image_embed_idx += 1 + (int)embed.shape()[1] + 6;
+        }
+        return image_embeds;
+    }
+
+    // encode_text: visual tokens + prompt → SDCondition
+    // This can be called standalone with cached visual tokens
+    SDCondition encode_text(int n_threads,
+                            const std::string& prompt_text,
+                            const std::vector<std::pair<int, sd::Tensor<float>>>& image_embeds) {
+        int64_t t0 = ggml_time_ms();
+        std::string prompt;
+        std::vector<std::pair<int, sd::Tensor<float>>> effective_image_embeds = image_embeds;
+        std::pair<int, int> prompt_attn_range;
+        int prompt_template_encode_start_idx = 0;
+        int min_length = 0;
+        int max_length = 100000000;
+        int hidden_states_min_length = 0;
+        std::set<int> out_layers = {9, 18, 27};
+
+        (void)hidden_states_min_length;
+
+        if (version == VERSION_FLUX2_KLEIN) {
+            prompt_template_encode_start_idx = 0;
+            min_length = 512;
+            out_layers = {9, 18, 27};
+
+            prompt = "<|im_start|>user\n";
+            if (!effective_image_embeds.empty()) {
+                std::string img_prompt;
+                std::string placeholder = "<|image_pad|>";
+                for (size_t i = 0; i < effective_image_embeds.size(); i++) {
+                    std::string image_prefix = prompt + img_prompt + "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
+                    const int image_embed_idx = static_cast<int>(tokenizer->encode(image_prefix, nullptr).size());
+                    effective_image_embeds[i].first = image_embed_idx;
+
+                    img_prompt += "Picture " + std::to_string(i + 1) + ": <|vision_start|>";
+                    int64_t num_tokens = effective_image_embeds[i].second.shape()[1];
+                    for (int j = 0; j < num_tokens; j++)
+                        img_prompt += placeholder;
+                    img_prompt += "<|vision_end|>";
+                }
+                prompt += img_prompt;
+            }
+
+            prompt_attn_range.first = (int)prompt.size();
+            prompt += prompt_text;
+            prompt_attn_range.second = (int)prompt.size();
+            prompt += "<|im_end|>\n<|im_start|>assistant\n thinking\n\n response\n\n";
+        } else {
+            prompt = prompt_text;
+        }
+
+        auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, false);
+        auto& tokens  = std::get<0>(tokens_weights_mask);
+        auto& weights = std::get<1>(tokens_weights_mask);
+        auto& mask    = std::get<2>(tokens_weights_mask);
+        sd::Tensor<int32_t> input_ids({(int64_t)tokens.size()}, tokens);
+        sd::Tensor<float> attention_mask;
+        if (!mask.empty()) {
+            attention_mask = sd::Tensor<float>({(int64_t)mask.size(), (int64_t)mask.size()});
+            float masked_val = -std::numeric_limits<float>::max() / 4.0f;
+            for (size_t i1 = 0; i1 < mask.size(); ++i1) {
+                for (size_t i0 = 0; i0 < mask.size(); ++i0) {
+                    float v = 0.0f;
+                    if (mask[i0] == 0.0f) v += masked_val;
+                    if (i0 > i1) v += masked_val;
+                    attention_mask[(int64_t)(i0 + mask.size() * i1)] = v;
+                }
+            }
+        }
+
+        auto raw_hidden_states = llm->compute(n_threads, input_ids, attention_mask, effective_image_embeds,
+                                              out_layers, false, false, true, true);
+        auto hidden_states = apply_token_weights(std::move(raw_hidden_states), weights);
+        GGML_ASSERT(!hidden_states.empty());
+
+        int64_t t1 = ggml_time_ms();
+        LOG_INFO("encode_text completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+
+        SDCondition result;
+        result.c_crossattn = std::move(hidden_states);
+        return result;
+    }
+
     SDCondition get_learned_condition(int n_threads,
                                       const ConditionerParams& conditioner_params) override {
         std::string prompt;
@@ -2001,9 +2121,9 @@ struct LLMEmbedder : public Conditioner {
         std::vector<std::pair<int, int>> extra_prompts_attn_range;
         std::vector<std::pair<int, sd::Tensor<float>>> image_embeds;
         int prompt_template_encode_start_idx = 34;
-        int min_length                       = 0;  // pad tokens
+        int min_length                       = 0;
         int max_length                       = 100000000;
-        int hidden_states_min_length         = 0;  // zero pad hidden_states
+        int hidden_states_min_length         = 0;
         bool spell_quotes                    = false;
         std::set<int> out_layers;
 

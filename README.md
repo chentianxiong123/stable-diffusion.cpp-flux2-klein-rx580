@@ -1,182 +1,214 @@
-<p align="center">
-  <img src="./assets/logo.png" width="360x">
-</p>
+# stable-diffusion.cpp-flux2-klein-rx580
 
-# stable-diffusion.cpp
+FLUX.2 Klein CLI fork based on `stable-diffusion.cpp`, focused on local Vulkan execution, RX580/RX590-class GPUs, and explicit one-stage-at-a-time CLI workflows.
 
-<div align="center">
-<a href="https://trendshift.io/repositories/9714" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9714" alt="leejet%2Fstable-diffusion.cpp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
+This fork is not intended as an upstream PR. It is a standalone working branch for FLUX.2 Klein experiments where every pipeline stage can be called like a function with clear inputs and outputs.
 
-Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
+## What This Fork Adds
 
-***Note that this project is under active development. \
-API and command-line option may change frequently.***
+- FLUX.2 Klein local CLI workflow.
+- Qwen3-VL / mmproj vision encoder compatibility work.
+- Atomic `sd-cli --stage` execution:
+  - `llm_encode_vision`
+  - `llm_encode_text`
+  - `vae_encode`
+  - `diffuse`
+  - `vae_decode`
+- Vulkan-friendly staged execution for RX580/RX590-class cards.
+- Explicit cache directories for stage input/output.
+- `--mask` support in atomic `diffuse`.
+- Manual mask drawing utility without Python generation workflow.
 
-## 🔥Important News
+## Design Rules
 
-* **2026/06/25** 🚀 stable-diffusion.cpp now supports **Krea2**
-* **2026/06/04** 🚀 stable-diffusion.cpp now supports **Ideogram4**
-* **2026/05/31** 🚀 stable-diffusion.cpp now supports **PiD**
-* **2026/05/27** 🚀 stable-diffusion.cpp now supports **Lens**
-* **2026/05/17** 🚀 stable-diffusion.cpp now supports **LTX-2.3**
-* **2026/04/11** 🚀 stable-diffusion.cpp now uses a brand-new embedded web UI.  
-* **2026/01/18** 🚀 stable-diffusion.cpp now supports **FLUX.2-klein**  
-* **2025/12/01** 🚀 stable-diffusion.cpp now supports **Z-Image**  
-* **2025/11/30** 🚀 stable-diffusion.cpp now supports **FLUX.2-dev**  
-* **2025/10/13** 🚀 stable-diffusion.cpp now supports **Qwen-Image-Edit / Qwen-Image-Edit 2509**  
-* **2025/10/12** 🚀 stable-diffusion.cpp now supports **Qwen-Image**  
-* **2025/09/14** 🚀 stable-diffusion.cpp now supports **Wan2.1 Vace**  
-* **2025/09/06** 🚀 stable-diffusion.cpp now supports **Wan2.1 / Wan2.2**  
+- Do not run comma-separated stages.
+- Run each stage in a separate `sd-cli` process.
+- Treat every stage as a callable function: inputs are paths/parameters, outputs are cache directories or final images.
+- Keep Python out of generation. Python is only for manual mask drawing or simple file inspection.
+- For release-style runs, keep only the final output image. Intermediate cache directories should be temporary and deleted after success.
+- Do not commit model files, images, local inputs, local outputs, or run caches.
 
-## Features
+## GPU Notes
 
-- Plain C/C++ implementation based on [ggml](https://github.com/ggml-org/ggml), working in the same way as [llama.cpp](https://github.com/ggml-org/llama.cpp)
-- Super lightweight and without external dependencies
-- Supported models
-  - Image Models
-    - [SD1.x, SD2.x, SD-Turbo](./docs/sd.md)
-    - [SDXL, SDXL-Turbo](./docs/sd.md)
-    - [Some SD1.x and SDXL distilled models](./docs/distilled_sd.md)
-    - [SD3/SD3.5](./docs/sd3.md)
-    - [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
-    - [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
-    - [Lens](./docs/lens.md)
-    - [Chroma](./docs/chroma.md)
-    - [Chroma1-Radiance](./docs/chroma_radiance.md)
-    - [Qwen Image](./docs/qwen_image.md)
-    - [PiD](./docs/pid.md)
-    - [LongCat Image](./docs/longcat_image.md)
-    - [Z-Image](./docs/z_image.md)
-    - [MiniT2I](./docs/minit2i.md)
-    - [Ovis-Image](./docs/ovis_image.md)
-    - [Anima](./docs/anima.md)
-    - [ERNIE-Image](./docs/ernie_image.md)
-    - [Boogu Image](./docs/boogu_image.md)
-    - [Krea2](./docs/krea2.md)
-    - [SeFi-Image](./docs/sefi_image.md)
-    - [HiDream-O1-Image](./docs/hidream_o1_image.md)
-    - [Ideogram4](./docs/ideogram4.md)
-  - Image Edit Models
-    - [FLUX.1-Kontext-dev](./docs/kontext.md)
-    - [Qwen Image Edit series](./docs/qwen_image_edit.md)
-    - [LongCat Image Edit](./docs/longcat_image.md)
-    - [Boogu Image Edit](./docs/boogu_image.md)
-  - Video Models
-    - [Wan2.1/Wan2.2](./docs/wan.md)
-    - [LTX-2.3](./docs/ltx2.md)
-  - [PhotoMaker](./docs/photo_maker.md) support.
-  - Control Net support with SD 1.5
-  - LoRA support, same as [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Features#lora)
-  - Latent Consistency Models support (LCM/LCM-LoRA)
-  - Faster and memory efficient latent decoding with [TAESD](./docs/taesd.md)
-  - Upscale images generated with [ESRGAN](./docs/esrgan.md)
-- Supported backends
-  - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
-  - CUDA
-  - Vulkan
-  - Metal
-  - OpenCL
-  - SYCL
-- Supported weight formats
-  - Pytorch checkpoint (`.ckpt` or `.pth` or `.pt`)
-  - Safetensors (`.safetensors`)
-  - GGUF (`.gguf`)
-- Convert mode supports converting model weights to `.gguf` or `.safetensors`
-- Supported platforms
-    - Linux
-    - Mac OS
-    - Windows
-    - Android (via Termux, [Local Diffusion](https://github.com/rmatif/Local-Diffusion))
-- Flash Attention for memory usage optimization
-- Negative prompt
-- [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) style tokenizer (not all the features, only token weighting for now)
-- VAE tiling processing for reduce memory usage
-- Sampling method
-    - `Euler A`
-    - `Euler`
-    - `Heun`
-    - `DPM2`
-    - `DPM++ 2M`
-    - [`DPM++ 2M v2`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457)
-    - `DPM++ 2S a`
-    - `ER-SDE`
-    - [`LCM`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/13952)
-- Cross-platform reproducibility
-    - `--rng cuda`, default, consistent with the `stable-diffusion-webui GPU RNG`
-    - `--rng cpu`, consistent with the `comfyui RNG`
-- Embedds generation parameters into png output as webui-compatible text string
+The local target is AMD RX580/RX590-class Vulkan execution.
 
-## Quick Start
+On this machine:
 
-### Get the sd executable
-
-- Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
-- Or build from source by following the [build guide](./docs/build.md)
-
-### Download model weights
-
-- download weights(.ckpt or .safetensors or .gguf). For example
-    - Stable Diffusion v1.5 from https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5 
-
-    ```sh
-    curl -L -O https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
-    ```
-
-### Generate an image with just one command
-
-```sh
-./bin/sd-cli -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat"
+```powershell
+Vulkan0 = integrated AMD GPU
+Vulkan1 = AMD Radeon RX590 GME
 ```
 
-***For detailed command-line arguments, check out [cli doc](./examples/cli/README.md).***
+Set this before running on RX580/RX590-class Vulkan drivers:
 
-## Performance
+```powershell
+$env:GGML_VK_FORCE_MAX_BUFFER_SIZE = "4294967296"
+```
 
-If you want to improve performance or reduce VRAM/RAM usage, please refer to [performance guide](./docs/performance.md).
-For runtime and parameter backend placement, see the [backend selection guide](./docs/backend.md).
+Prefer explicit backend selection:
 
-## More Guides
+```powershell
+--backend "te=Vulkan1,diffusion=Vulkan1,vae=Vulkan1"
+```
 
-- [Backend selection](./docs/backend.md)
-- [RPC](./docs/rpc.md)
-- [LoRA](./docs/lora.md)
-- [LCM/LCM-LoRA](./docs/lcm.md)
-- [Docker](./docs/docker.md)
-- [Quantization and GGUF](./docs/quantization_and_gguf.md)
-- [Inference acceleration via caching](./docs/caching.md)
+For some atomic stages, a narrower backend is enough:
 
-## Bindings
+```powershell
+--backend "te=Vulkan1"
+--backend "vae=Vulkan1"
+--backend "diffusion=Vulkan1,vae=Vulkan1"
+```
 
-These projects wrap `stable-diffusion.cpp` for easier use in other languages/frameworks.
+## Build
 
-* Golang (non-cgo): [seasonjs/stable-diffusion](https://github.com/seasonjs/stable-diffusion)
-* Golang (cgo): [Binozo/GoStableDiffusion](https://github.com/Binozo/GoStableDiffusion)
-* Golang (non-cgo): [l8bloom/gosd](https://github.com/l8bloom/gosd)
-* C#: [DarthAffe/StableDiffusion.NET](https://github.com/DarthAffe/StableDiffusion.NET)
-* Python: [william-murray1204/stable-diffusion-cpp-python](https://github.com/william-murray1204/stable-diffusion-cpp-python)
-* Rust: [newfla/diffusion-rs](https://github.com/newfla/diffusion-rs)
-* Flutter/Dart: [rmatif/Local-Diffusion](https://github.com/rmatif/Local-Diffusion)
+Use the existing CMake flow from `stable-diffusion.cpp`.
 
-## UIs
+Debug build example:
 
-These projects use `stable-diffusion.cpp` as a backend for their image generation.
+```powershell
+cmake --build build --config Debug --target stable-diffusion.cpp-flux2-klein-rx580
+```
 
-- [Jellybox](https://jellybox.com)
-- [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
-- [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)
-- [Local Diffusion](https://github.com/rmatif/Local-Diffusion)
-- [sd.cpp-webui](https://github.com/daniandtheweb/sd.cpp-webui)
-- [LocalAI](https://github.com/mudler/LocalAI)
-- [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
-- [KoboldCpp](https://github.com/LostRuins/koboldcpp)
+The local development binary is:
 
-## Contributors
+```powershell
+.\build\bin\Debug\stable-diffusion.cpp-flux2-klein-rx580.exe
+```
 
-Thank you to all the people who have already contributed to stable-diffusion.cpp!
+## Model Paths
 
-[![Contributors](https://contrib.rocks/image?repo=leejet/stable-diffusion.cpp)](https://github.com/leejet/stable-diffusion.cpp/graphs/contributors)
+Expected local model paths:
 
-## Star History
+```powershell
+$Diffusion = "D:\models\flux-2-klein-9b-Q4_0.gguf"
+$LLM       = "D:\models\qwen3-vl-7b-llm-q4_k_m.gguf"
+$Vision    = "D:\models\mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+$VAE       = "D:\models\flux2-vae.safetensors"
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=leejet/stable-diffusion.cpp&type=Date)](https://star-history.com/#leejet/stable-diffusion.cpp&Date)
+Model files are intentionally ignored by Git.
+
+## Atomic Stage Interface
+
+Each stage should be called independently.
+
+| Stage | Input | Output |
+|---|---|---|
+| `llm_encode_vision` | `--ref-image`, `--llm`, `--llm_vision` | `--vision-out` |
+| `llm_encode_text` | `--prompt`, `--llm`, optional `--vision-out` | `--llm-out` |
+| `vae_encode` | `--ref-image`, `--vae` | `--vae-out` |
+| `diffuse` | `--llm-out`, optional `--vae-out`, optional `--init-img`, optional `--mask` | `--diffuse-out` |
+| `vae_decode` | `--diffuse-out`, `--vae` | `-o` |
+
+If you pass a comma-separated stage list, the CLI rejects it. This keeps memory ownership and cache handoff explicit.
+
+## Example: Text/Reference Inpaint Without Vision
+
+This is the current lightweight route for RX580/RX590-class testing.
+
+```powershell
+$env:GGML_VK_FORCE_MAX_BUFFER_SIZE = "4294967296"
+
+$Cli = ".\build\bin\Debug\stable-diffusion.cpp-flux2-klein-rx580.exe"
+$Diffusion = "D:\models\flux-2-klein-9b-Q4_0.gguf"
+$LLM = "D:\models\qwen3-vl-7b-llm-q4_k_m.gguf"
+$VAE = "D:\models\flux2-vae.safetensors"
+
+$W = 384
+$H = 576
+$Seed = 42
+$Steps = 4
+$Work = "$env:TEMP\flux2-klein-run"
+$Out = "D:\output\output.png"
+
+Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $Work | Out-Null
+```
+
+Text encoding:
+
+```powershell
+& $Cli --stage llm_encode_text --backend "te=Vulkan1" `
+  --diffusion-model $Diffusion --vae $VAE --llm $LLM `
+  -W $W -H $H --seed $Seed `
+  --llm-out "$Work\llm" `
+  --prompt "local inpainting, preserve the original image structure, natural blending"
+```
+
+Reference VAE encoding:
+
+```powershell
+& $Cli --stage vae_encode --backend "vae=Vulkan1" `
+  --diffusion-model $Diffusion --vae $VAE `
+  -W $W -H $H --seed $Seed `
+  --vae-out "$Work\vae" `
+  --ref-image "D:\path\reference.png"
+```
+
+Diffusion:
+
+```powershell
+& $Cli --stage diffuse --backend "diffusion=Vulkan1,vae=Vulkan1" `
+  --diffusion-model $Diffusion --vae $VAE `
+  -W $W -H $H --seed $Seed `
+  --llm-out "$Work\llm" `
+  --vae-out "$Work\vae" `
+  --diffuse-out "$Work\diffuse" `
+  --prompt "local inpainting, preserve the original image structure, natural blending" `
+  --steps $Steps `
+  --init-img "D:\path\target.png" `
+  --mask "D:\path\mask.png"
+```
+
+Decode:
+
+```powershell
+& $Cli --stage vae_decode --backend "vae=Vulkan1" `
+  --diffusion-model $Diffusion --vae $VAE `
+  -W $W -H $H --seed $Seed `
+  --diffuse-out "$Work\diffuse" `
+  -o $Out
+```
+
+Clean temporary stage caches after success:
+
+```powershell
+Remove-Item -LiteralPath $Work -Recurse -Force
+```
+
+## Manual Mask Utility
+
+The only retained Python tool is:
+
+```powershell
+python .\project\manual_mask_draw.py `
+  --image "D:\path\target.png" `
+  --mask-out "D:\path\mask.png" `
+  --image-out "D:\path\target_copy.png"
+```
+
+Rules:
+
+- The mask must be drawn against the exact target image.
+- The mask and target must have the same dimensions.
+- No crop workflow.
+- No automatic mask resize.
+- No automatic mask alignment.
+
+## Repository Hygiene
+
+This repository intentionally excludes:
+
+- all image files
+- generated outputs
+- local inputs
+- run directories
+- model weights
+- local LoRA files
+- build products
+
+Use `git status --short` before publishing and confirm no image files are staged.
+
+## License
+
+This fork keeps the original `stable-diffusion.cpp` license and attribution. See `LICENSE`.

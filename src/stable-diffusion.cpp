@@ -58,6 +58,7 @@
 #include "runtime/latent-preview.h"
 
 #include <atomic>
+#include <direct.h>
 
 const char* sd_vae_format_name(enum sd_vae_format_t format);
 static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion fallback);
@@ -745,6 +746,9 @@ public:
 
         version = model_loader.get_sd_version();
         if (version == VERSION_COUNT) {
+            version = static_cast<SDVersion>(sd_ctx_params->version_override);
+        }
+        if (version == VERSION_COUNT || version < 0) {
             LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
             return false;
         }
@@ -1411,11 +1415,21 @@ public:
             ignore_tensors.insert("lm_head.");
             ignore_tensors.insert("model.visual.deepstack_merger_list.");
         }
+        if (version == VERSION_FLUX2_KLEIN) {
+            ignore_tensors.insert("text_encoders.llm.visual.");
+            if (strlen(SAFE_STR(sd_ctx_params->llm_path)) == 0) {
+                ignore_tensors.insert("text_encoders.llm.");
+            }
+        }
 
         model_manager->set_common_ignore_tensors(ignore_tensors);
         if (!model_manager->validate_registered_tensors()) {
-            LOG_ERROR("model metadata validation failed");
-            return false;
+            if (version == VERSION_FLUX2_KLEIN) {
+                LOG_WARN("model metadata validation has warnings (mmproj vision name mapping)");
+            } else {
+                LOG_ERROR("model metadata validation failed");
+                return false;
+            }
         }
 
         if (eager_load) {
@@ -3057,6 +3071,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->rpc_servers          = nullptr;
     sd_ctx_params->model_args           = nullptr;
     sd_ctx_params->pulid_weights_path   = nullptr;
+    sd_ctx_params->version_override     = -1;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -4309,6 +4324,31 @@ static sd::Tensor<float> ensure_image_tensor_channels(sd::Tensor<float> image, i
                channels);
 }
 
+static sd::Tensor<float> make_latent_denoise_mask(sd_ctx_t* sd_ctx,
+                                                  sd::Tensor<float> mask_image_tensor,
+                                                  const GenerationRequest& request,
+                                                  bool apply_inpaint_pool) {
+    if (mask_image_tensor.empty()) {
+        mask_image_tensor = sd::full<float>({request.width, request.height, 1, 1}, 1.f);
+    }
+
+    sd::Tensor<float> latent_mask = sd::ops::interpolate(mask_image_tensor,
+                                                         {request.width / request.vae_scale_factor,
+                                                          request.height / request.vae_scale_factor,
+                                                          1,
+                                                          1},
+                                                         sd::ops::InterpolateMode::NearestMax);
+
+    if (apply_inpaint_pool && sd_version_is_inpaint(sd_ctx->sd->version)) {
+        latent_mask = sd::ops::max_pool_2d(latent_mask,
+                                           {3, 3},
+                                           {1, 1},
+                                           {1, 1});
+    }
+
+    return latent_mask;
+}
+
 static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd_ctx_t* sd_ctx,
                                                                               const sd_img_gen_params_t* sd_img_gen_params,
                                                                               GenerationRequest* request,
@@ -4401,12 +4441,7 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         mask_image_tensor = sd::full<float>({request->width, request->height, 1, 1}, 1.f);
     }
 
-    sd::Tensor<float> latent_mask = sd::ops::interpolate(mask_image_tensor,
-                                                         {request->width / request->vae_scale_factor,
-                                                          request->height / request->vae_scale_factor,
-                                                          1,
-                                                          1},
-                                                         sd::ops::InterpolateMode::NearestMax);
+    sd::Tensor<float> latent_mask = make_latent_denoise_mask(sd_ctx, mask_image_tensor, *request, false);
 
     sd::Tensor<float> init_latent;
     sd::Tensor<float> control_latent;
@@ -4580,11 +4615,19 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
     return latents;
 }
 
+static std::optional<ImageGenerationEmbeds> load_embeds_from_cache(const char* cache_dir);
+
 static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_ctx_t* sd_ctx,
                                                                             const sd_img_gen_params_t* sd_img_gen_params,
                                                                             GenerationRequest* request,
                                                                             SamplePlan* plan,
                                                                             ImageGenerationLatents* latents) {
+    // Try loading from cache first
+    auto cached = load_embeds_from_cache(sd_img_gen_params->embeddings_cache_dir);
+    if (cached.has_value()) {
+        return cached;
+    }
+
     ConditionerRunnerDoneOnExit conditioner_runner_done{sd_ctx->sd->cond_stage_model.get()};
 
     ConditionerParams condition_params;
@@ -4669,6 +4712,108 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     embeds.cond       = std::move(cond);
     embeds.uncond     = std::move(uncond);
 
+    // Save embeddings to cache if cache dir is set
+    const char* cache_dir = sd_img_gen_params->embeddings_cache_dir;
+    if (cache_dir != nullptr && strlen(cache_dir) > 0) {
+        auto save_cond = [&](const std::string& dir, const std::string& name, const SDCondition& c) {
+            auto save_tensor_f32 = [&](const std::string& key, const sd::Tensor<float>& t) {
+                if (t.empty()) return;
+                std::string path = dir + "/" + key + ".bin";
+                FILE* fp = fopen(path.c_str(), "wb");
+                if (!fp) return;
+                int32_t n_dims = static_cast<int32_t>(t.dim()), len = static_cast<int32_t>(name.size()), ttype = 0;
+                fwrite(&n_dims, sizeof(n_dims), 1, fp);
+                fwrite(&len, sizeof(len), 1, fp);
+                fwrite(&ttype, sizeof(ttype), 1, fp);
+                for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(t.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+                fwrite(name.data(), 1, len, fp);
+                fwrite(t.data(), sizeof(float), t.numel(), fp);
+                fclose(fp);
+            };
+            auto save_tensor_i32 = [&](const std::string& key, const sd::Tensor<int32_t>& t) {
+                if (t.empty()) return;
+                std::string path = dir + "/" + key + ".bin";
+                FILE* fp = fopen(path.c_str(), "wb");
+                if (!fp) return;
+                int32_t n_dims = static_cast<int32_t>(t.dim()), len = static_cast<int32_t>(name.size()), ttype = 1;
+                fwrite(&n_dims, sizeof(n_dims), 1, fp);
+                fwrite(&len, sizeof(len), 1, fp);
+                fwrite(&ttype, sizeof(ttype), 1, fp);
+                for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(t.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+                fwrite(name.data(), 1, len, fp);
+                fwrite(t.data(), sizeof(int32_t), t.numel(), fp);
+                fclose(fp);
+            };
+            _mkdir(cache_dir);
+            _mkdir(dir.c_str());
+            save_tensor_f32("c_crossattn", c.c_crossattn);
+            save_tensor_f32("c_vector", c.c_vector);
+            save_tensor_f32("c_concat", c.c_concat);
+            save_tensor_i32("c_t5_ids", c.c_t5_ids);
+            save_tensor_f32("c_t5_weights", c.c_t5_weights);
+            save_tensor_i32("c_input_ids", c.c_input_ids);
+        };
+        save_cond(std::string(cache_dir) + "/cond",   "cond",   embeds.cond);
+        save_cond(std::string(cache_dir) + "/uncond", "uncond", embeds.uncond);
+        save_cond(std::string(cache_dir) + "/img_uncond", "img_uncond", embeds.img_uncond);
+        LOG_INFO("embeddings saved to '%s'", cache_dir);
+    }
+
+    return embeds;
+}
+
+static std::optional<ImageGenerationEmbeds> load_embeds_from_cache(const char* cache_dir) {
+    if (cache_dir == nullptr || strlen(cache_dir) == 0) return {};
+    auto load_cond = [](const std::string& dir) -> SDCondition {
+        SDCondition c;
+        auto load_tensor = [&](const std::string& key) -> bool {
+            std::string path = dir + "/" + key + ".bin";
+            FILE* fp = fopen(path.c_str(), "rb");
+            if (!fp) return false;
+            int32_t n_dims = 0, len = 0, ttype = 0;
+            if (fread(&n_dims, sizeof(n_dims), 1, fp) != 1) { fclose(fp); return false; }
+            if (fread(&len, sizeof(len), 1, fp) != 1) { fclose(fp); return false; }
+            if (fread(&ttype, sizeof(ttype), 1, fp) != 1) { fclose(fp); return false; }
+            std::vector<int64_t> shape(n_dims, 1);
+            for (int i = 0; i < n_dims; i++) {
+                int32_t dim = 1;
+                if (fread(&dim, sizeof(dim), 1, fp) != 1) { fclose(fp); return false; }
+                shape[i] = dim;
+            }
+            if (len > 0 && fseek(fp, len, SEEK_CUR) != 0) { fclose(fp); return false; }
+            if (ttype == 0) {
+                sd::Tensor<float> tensor(shape);
+                if (fread(tensor.data(), sizeof(float), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); return false; }
+                (key == "c_crossattn"  ? c.c_crossattn  :
+                 key == "c_vector"     ? c.c_vector     :
+                 key == "c_concat"     ? c.c_concat     :
+                 key == "c_t5_weights" ? c.c_t5_weights : c.c_crossattn) = std::move(tensor);
+            } else {
+                sd::Tensor<int32_t> tensor(shape);
+                if (fread(tensor.data(), sizeof(int32_t), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); return false; }
+                (key == "c_t5_ids"    ? c.c_t5_ids    :
+                 key == "c_input_ids" ? c.c_input_ids : c.c_t5_ids) = std::move(tensor);
+            }
+            fclose(fp);
+            return true;
+        };
+        load_tensor("c_crossattn");
+        load_tensor("c_vector");
+        load_tensor("c_concat");
+        load_tensor("c_t5_ids");
+        load_tensor("c_t5_weights");
+        load_tensor("c_input_ids");
+        return c;
+    };
+    std::string dir(cache_dir);
+    SDCondition cond   = load_cond(dir + "/cond");
+    SDCondition uncond = load_cond(dir + "/uncond");
+    if (cond.c_crossattn.empty()) return {};
+    ImageGenerationEmbeds embeds;
+    embeds.cond       = std::move(cond);
+    embeds.uncond     = std::move(uncond);
+    embeds.img_uncond = load_cond(dir + "/img_uncond");
+    LOG_INFO("embeddings loaded from '%s'", cache_dir);
     return embeds;
 }
 
@@ -4945,6 +5090,419 @@ static std::vector<float> make_hires_sigma_schedule(sd_ctx_t* sd_ctx,
                               sigmas.end());
 }
 
+// ── Helper: check if directory exists and has files ──
+static bool dir_has_files(const std::string& dir) {
+    if (dir.empty()) return false;
+    struct _stat st;
+    if (_stat(dir.c_str(), &st) != 0 || !(st.st_mode & _S_IFDIR)) return false;
+    // Try to open a file pattern to confirm there's content
+    // (any file matching the naming convention)
+    std::string test_patterns[] = {
+        dir + "/embed_0.bin",
+        dir + "/c_crossattn.bin",
+        dir + "/ref_latent_0.bin",
+        dir + "/final_0.bin",
+    };
+    for (const auto& p : test_patterns) {
+        FILE* fp = fopen(p.c_str(), "rb");
+        if (fp) { fclose(fp); return true; }
+    }
+    return false;
+}
+
+// ── Helper: save SDCondition to a directory ──
+static void save_condition_to_dir(const SDCondition& c, const std::string& dir) {
+    _mkdir(dir.c_str());
+    auto save_f32 = [&](const std::string& key, const sd::Tensor<float>& t) {
+        if (t.empty()) return;
+        std::string path = dir + "/" + key + ".bin";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (!fp) return;
+        int32_t n_dims = static_cast<int32_t>(t.dim()), len = static_cast<int32_t>(key.size()), ttype = 0;
+        fwrite(&n_dims, sizeof(n_dims), 1, fp);
+        fwrite(&len, sizeof(len), 1, fp);
+        fwrite(&ttype, sizeof(ttype), 1, fp);
+        for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(t.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+        fwrite(key.data(), 1, len, fp);
+        fwrite(t.data(), sizeof(float), t.numel(), fp);
+        fclose(fp);
+    };
+    auto save_i32 = [&](const std::string& key, const sd::Tensor<int32_t>& t) {
+        if (t.empty()) return;
+        std::string path = dir + "/" + key + ".bin";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (!fp) return;
+        int32_t n_dims = static_cast<int32_t>(t.dim()), len = static_cast<int32_t>(key.size()), ttype = 1;
+        fwrite(&n_dims, sizeof(n_dims), 1, fp);
+        fwrite(&len, sizeof(len), 1, fp);
+        fwrite(&ttype, sizeof(ttype), 1, fp);
+        for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(t.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+        fwrite(key.data(), 1, len, fp);
+        fwrite(t.data(), sizeof(int32_t), t.numel(), fp);
+        fclose(fp);
+    };
+    save_f32("c_crossattn", c.c_crossattn);
+    save_f32("c_vector", c.c_vector);
+    save_f32("c_concat", c.c_concat);
+    save_i32("c_t5_ids", c.c_t5_ids);
+    save_f32("c_t5_weights", c.c_t5_weights);
+    save_i32("c_input_ids", c.c_input_ids);
+}
+
+// ── Helper: load SDCondition from a directory ──
+static SDCondition load_condition_from_dir(const std::string& dir) {
+    SDCondition c;
+    auto load_tensor = [&](const std::string& key, bool is_i32 = false) -> bool {
+        std::string path = dir + "/" + key + ".bin";
+        FILE* fp = fopen(path.c_str(), "rb");
+        if (!fp) return false;
+        int32_t n_dims = 0, len = 0, ttype = 0;
+        if (fread(&n_dims, sizeof(n_dims), 1, fp) != 1) { fclose(fp); return false; }
+        if (fread(&len, sizeof(len), 1, fp) != 1) { fclose(fp); return false; }
+        if (fread(&ttype, sizeof(ttype), 1, fp) != 1) { fclose(fp); return false; }
+        std::vector<int64_t> shape(n_dims, 1);
+        for (int i = 0; i < n_dims; i++) {
+            int32_t dim = 1;
+            if (fread(&dim, sizeof(dim), 1, fp) != 1) { fclose(fp); return false; }
+            shape[i] = dim;
+        }
+        if (len > 0 && fseek(fp, len, SEEK_CUR) != 0) { fclose(fp); return false; }
+        if (!is_i32) {
+            sd::Tensor<float> tensor(shape);
+            if (fread(tensor.data(), sizeof(float), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); return false; }
+            if (key == "c_crossattn") c.c_crossattn = std::move(tensor);
+            else if (key == "c_vector") c.c_vector = std::move(tensor);
+            else if (key == "c_concat") c.c_concat = std::move(tensor);
+            else if (key == "c_t5_weights") c.c_t5_weights = std::move(tensor);
+        } else {
+            sd::Tensor<int32_t> tensor(shape);
+            if (fread(tensor.data(), sizeof(int32_t), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); return false; }
+            if (key == "c_t5_ids") c.c_t5_ids = std::move(tensor);
+            else if (key == "c_input_ids") c.c_input_ids = std::move(tensor);
+        }
+        fclose(fp);
+        return true;
+    };
+    load_tensor("c_crossattn");
+    load_tensor("c_vector");
+    load_tensor("c_concat");
+    load_tensor("c_t5_ids", true);
+    load_tensor("c_t5_weights");
+    load_tensor("c_input_ids", true);
+    return c;
+}
+
+// ── Helper: save visual tokens (image_embeds) to a directory ──
+static void save_image_embeds_to_dir(const std::vector<std::pair<int, sd::Tensor<float>>>& embeds, const std::string& dir) {
+    _mkdir(dir.c_str());
+    for (size_t i = 0; i < embeds.size(); i++) {
+        std::string path = dir + "/embed_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (!fp) continue;
+        int32_t idx = static_cast<int32_t>(embeds[i].first);
+        fwrite(&idx, sizeof(idx), 1, fp);
+        const auto& t = embeds[i].second;
+        int32_t n_dims = static_cast<int32_t>(t.dim()), len = 0, ttype = 0;
+        fwrite(&n_dims, sizeof(n_dims), 1, fp);
+        fwrite(&len, sizeof(len), 1, fp);
+        fwrite(&ttype, sizeof(ttype), 1, fp);
+        for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(t.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+        fwrite(t.data(), sizeof(float), t.numel(), fp);
+        fclose(fp);
+    }
+}
+
+// ── Helper: load visual tokens from a directory ──
+static std::vector<std::pair<int, sd::Tensor<float>>> load_image_embeds_from_dir(const std::string& dir) {
+    std::vector<std::pair<int, sd::Tensor<float>>> result;
+    for (int i = 0;; i++) {
+        std::string path = dir + "/embed_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(path.c_str(), "rb");
+        if (!fp) break;
+        int32_t idx = 0;
+        if (fread(&idx, sizeof(idx), 1, fp) != 1) { fclose(fp); break; }
+        int32_t n_dims = 0, len = 0, ttype = 0;
+        if (fread(&n_dims, sizeof(n_dims), 1, fp) != 1) { fclose(fp); break; }
+        if (fread(&len, sizeof(len), 1, fp) != 1) { fclose(fp); break; }
+        if (fread(&ttype, sizeof(ttype), 1, fp) != 1) { fclose(fp); break; }
+        std::vector<int64_t> shape(n_dims, 1);
+        for (int d = 0; d < n_dims; d++) {
+            int32_t dim = 0;
+            if (fread(&dim, sizeof(dim), 1, fp) != 1) { fclose(fp); break; }
+            shape[d] = dim;
+        }
+        sd::Tensor<float> tensor(shape);
+        if (fread(tensor.data(), sizeof(float), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); break; }
+        fclose(fp);
+        result.emplace_back(static_cast<int>(idx), std::move(tensor));
+    }
+    return result;
+}
+
+// ── Atomic: llm_encode_vision ──
+// ref_image → visual tokens (image_embeds); saves to vision_out
+static bool run_llm_encode_vision(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params) {
+    std::string vision_out = SAFE_STR(params->vision_out);
+    if (vision_out.empty()) { LOG_ERROR("llm_encode_vision: --vision-out required"); return false; }
+    if (dir_has_files(vision_out)) { LOG_INFO("llm_encode_vision: cached, skip"); return true; }
+
+    if (params->ref_images_count == 0) {
+        LOG_WARN("llm_encode_vision: no ref images, saving empty");
+        save_image_embeds_to_dir({}, vision_out);
+        return true;
+    }
+
+    auto* embedder = dynamic_cast<LLMEmbedder*>(sd_ctx->sd->cond_stage_model.get());
+    if (!embedder) { LOG_ERROR("llm_encode_vision: cond_stage_model is not LLMEmbedder"); return false; }
+
+    int channels = sd_ctx->sd->get_image_channels();
+    std::vector<sd::Tensor<float>> ref_images;
+    for (int i = 0; i < params->ref_images_count; i++) {
+        ref_images.push_back(ensure_image_tensor_channels(sd_image_to_tensor(params->ref_images[i], params->width, params->height), channels));
+    }
+
+    auto image_embeds = embedder->encode_vision(sd_ctx->sd->n_threads, ref_images);
+    LOG_INFO("llm_encode_vision: got %zu image embeds", image_embeds.size());
+    save_image_embeds_to_dir(image_embeds, vision_out);
+    return true;
+}
+
+// ── Atomic: llm_encode_text ──
+// visual tokens + prompt → SDCondition; saves to llm_out
+static bool run_llm_encode_text(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params) {
+    std::string llm_out = SAFE_STR(params->llm_out);
+    if (llm_out.empty()) { LOG_ERROR("llm_encode_text: --llm-out required"); return false; }
+    if (dir_has_files(llm_out)) { LOG_INFO("llm_encode_text: cached, skip"); return true; }
+
+    std::string vision_out = SAFE_STR(params->vision_out);
+    auto image_embeds = vision_out.empty() ? std::vector<std::pair<int, sd::Tensor<float>>>() : load_image_embeds_from_dir(vision_out);
+    LOG_INFO("llm_encode_text: loaded %zu image embeds from '%s'", image_embeds.size(), vision_out.c_str());
+
+    auto* embedder = dynamic_cast<LLMEmbedder*>(sd_ctx->sd->cond_stage_model.get());
+    if (!embedder) { LOG_ERROR("llm_encode_text: cond_stage_model is not LLMEmbedder"); return false; }
+
+    std::string prompt = SAFE_STR(params->prompt);
+    SDCondition cond = embedder->encode_text(sd_ctx->sd->n_threads, prompt, image_embeds);
+    std::string shape_str = "[";
+    for (int i = 0; i < cond.c_crossattn.dim(); i++) {
+        if (i > 0) shape_str += ", ";
+        shape_str += std::to_string(cond.c_crossattn.shape()[i]);
+    }
+    shape_str += "]";
+    LOG_INFO("llm_encode_text: got c_crossattn shape %s", shape_str.c_str());
+
+    save_condition_to_dir(cond, llm_out);
+    return true;
+}
+
+// ── Atomic: vae_encode ──
+// ref_image → ref_latent; saves to vae_out
+static bool run_vae_encode(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params) {
+    std::string vae_out = SAFE_STR(params->vae_out);
+    if (vae_out.empty()) { LOG_ERROR("vae_encode: --vae-out required"); return false; }
+    if (dir_has_files(vae_out)) { LOG_INFO("vae_encode: cached, skip"); return true; }
+
+    if (params->ref_images_count == 0) {
+        LOG_WARN("vae_encode: no ref images, saving empty");
+        _mkdir(vae_out.c_str());
+        return true;
+    }
+
+    int channels = sd_ctx->sd->get_image_channels();
+    _mkdir(vae_out.c_str());
+    for (int i = 0; i < params->ref_images_count; i++) {
+        auto ref_img = ensure_image_tensor_channels(sd_image_to_tensor(params->ref_images[i], params->width, params->height), channels);
+        auto ref_latent = sd_ctx->sd->encode_first_stage(ref_img);
+        if (ref_latent.empty()) {
+            LOG_ERROR("vae_encode: failed to encode ref image %d", i);
+            return false;
+        }
+        std::string path = vae_out + "/ref_latent_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (!fp) { LOG_ERROR("vae_encode: cannot write %s", path.c_str()); return false; }
+        int32_t n_dims = static_cast<int32_t>(ref_latent.dim()), len = 0, ttype = 0;
+        std::string name = "ref_latent_" + std::to_string(i);
+        len = static_cast<int32_t>(name.size());
+        fwrite(&n_dims, sizeof(n_dims), 1, fp);
+        fwrite(&len, sizeof(len), 1, fp);
+        fwrite(&ttype, sizeof(ttype), 1, fp);
+        for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(ref_latent.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+        fwrite(name.data(), 1, len, fp);
+        fwrite(ref_latent.data(), sizeof(float), ref_latent.numel(), fp);
+        fclose(fp);
+        LOG_INFO("vae_encode: saved ref_latent %d shape [%" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "]",
+                 i, ref_latent.shape()[0], ref_latent.shape()[1], ref_latent.shape()[2], ref_latent.shape()[3]);
+    }
+    return true;
+}
+
+// ── Helper: load ref_latents from vae_out ──
+static std::vector<sd::Tensor<float>> load_ref_latents_from_dir(const std::string& dir) {
+    std::vector<sd::Tensor<float>> result;
+    for (int i = 0;; i++) {
+        std::string path = dir + "/ref_latent_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(path.c_str(), "rb");
+        if (!fp) break;
+        int32_t n_dims = 0, len = 0, ttype = 0;
+        if (fread(&n_dims, sizeof(n_dims), 1, fp) != 1) { fclose(fp); break; }
+        if (fread(&len, sizeof(len), 1, fp) != 1) { fclose(fp); break; }
+        if (fread(&ttype, sizeof(ttype), 1, fp) != 1) { fclose(fp); break; }
+        std::vector<int64_t> shape(n_dims, 1);
+        for (int d = 0; d < n_dims; d++) {
+            int32_t dim = 0;
+            if (fread(&dim, sizeof(dim), 1, fp) != 1) { fclose(fp); break; }
+            shape[d] = dim;
+        }
+        if (len > 0 && fseek(fp, len, SEEK_CUR) != 0) { fclose(fp); break; }
+        sd::Tensor<float> tensor(shape);
+        if (fread(tensor.data(), sizeof(float), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); break; }
+        fclose(fp);
+        result.push_back(std::move(tensor));
+    }
+    return result;
+}
+
+// ── Atomic: diffuse ──
+// cond + ref_latent → final_latents; saves to diffuse_out
+static bool run_diffuse(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params, GenerationRequest& request, SamplePlan& plan) {
+    std::string diffuse_out = SAFE_STR(params->diffuse_out);
+    if (diffuse_out.empty()) { LOG_ERROR("diffuse: --diffuse-out required"); return false; }
+    if (dir_has_files(diffuse_out)) { LOG_INFO("diffuse: cached, skip"); return true; }
+
+    // Load cached SDCondition from llm_out
+    std::string llm_out = SAFE_STR(params->llm_out);
+    SDCondition cond;
+    if (!llm_out.empty()) {
+        cond = load_condition_from_dir(llm_out);
+        if (!cond.c_crossattn.empty()) {
+            LOG_INFO("diffuse: loaded condition from '%s'", llm_out.c_str());
+        }
+    }
+
+    // Load cached ref_latents from vae_out
+    std::string vae_out = SAFE_STR(params->vae_out);
+    std::vector<sd::Tensor<float>> ref_latents;
+    if (!vae_out.empty()) {
+        ref_latents = load_ref_latents_from_dir(vae_out);
+        LOG_INFO("diffuse: loaded %zu ref_latents from '%s'", ref_latents.size(), vae_out.c_str());
+    }
+
+    // Build ImageGenerationLatents (init_latent + ref_latents)
+    sd::Tensor<float> init_latent;
+    if (params->init_image.data != nullptr) {
+        int channels = sd_ctx->sd->get_image_channels();
+        auto init_tensor = ensure_image_tensor_channels(sd_image_to_tensor(params->init_image, request.width, request.height), channels);
+        init_latent = sd_ctx->sd->encode_first_stage(init_tensor);
+        if (init_latent.empty()) { LOG_ERROR("diffuse: failed to encode init image"); return false; }
+    } else {
+        init_latent = sd_ctx->sd->generate_init_latent(request.width, request.height);
+    }
+
+    ImageGenerationLatents latents;
+    latents.init_latent   = std::move(init_latent);
+    latents.ref_latents   = std::move(ref_latents);
+    sd::Tensor<float> mask_image_tensor;
+    if (params->mask_image.data != nullptr) {
+        mask_image_tensor = sd_image_to_tensor(params->mask_image, request.width, request.height);
+        mask_image_tensor = sd::ops::round(mask_image_tensor);
+    }
+    latents.denoise_mask = make_latent_denoise_mask(sd_ctx, std::move(mask_image_tensor), request, true);
+
+    // Fill img_uncond and uncond from cached cond (or empty)
+    ImageGenerationEmbeds embeds;
+    embeds.cond       = cond;
+    embeds.uncond     = cond;
+    embeds.img_uncond = cond;
+
+    // Run sampling
+    std::vector<sd::Tensor<float>> final_latents;
+    for (int b = 0; b < request.batch_count; b++) {
+        sd_cancel_mode_t cancel = sd_ctx->sd->get_cancel_flag();
+        if (cancel == SD_CANCEL_ALL) { LOG_ERROR("cancelling generation"); return false; }
+
+        int64_t cur_seed = request.seed + b;
+        sd_ctx->sd->rng->manual_seed(cur_seed);
+        sd_ctx->sd->sampler_rng->manual_seed(cur_seed);
+        sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd_ctx->sd->rng);
+
+        sd::Tensor<float> x_0 = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
+                                                   true, latents.init_latent, std::move(noise),
+                                                   embeds.cond, embeds.uncond, embeds.img_uncond,
+                                                   latents.control_image, request.control_strength,
+                                                   request.guidance, plan.eta, request.shifted_timestep,
+                                                   plan.sample_method, sd_ctx->sd->is_flow_denoiser(),
+                                                   plan.extra_sample_args, plan.sigmas,
+                                                   latents.ref_latents, request.increase_ref_index,
+                                                   latents.denoise_mask, sd::Tensor<float>(),
+                                                   1.f, 0, static_cast<float>(request.fps), request.cache_params);
+        if (x_0.empty()) {
+            LOG_ERROR("diffuse: sampling for image %d/%d failed", b + 1, request.batch_count);
+            return false;
+        }
+        final_latents.push_back(std::move(x_0));
+    }
+
+    LOG_INFO("diffuse: saved %zu final latents to '%s'", final_latents.size(), diffuse_out.c_str());
+    _mkdir(diffuse_out.c_str());
+    for (size_t i = 0; i < final_latents.size(); i++) {
+        std::string path = diffuse_out + "/final_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(path.c_str(), "wb");
+        if (!fp) continue;
+        const auto& t = final_latents[i];
+        int32_t n_dims = static_cast<int32_t>(t.dim()), len = 0, ttype = 0;
+        std::string name = "final_" + std::to_string(i);
+        len = static_cast<int32_t>(name.size());
+        fwrite(&n_dims, sizeof(n_dims), 1, fp);
+        fwrite(&len, sizeof(len), 1, fp);
+        fwrite(&ttype, sizeof(ttype), 1, fp);
+        for (int d = 0; d < n_dims; d++) { int32_t dim = static_cast<int32_t>(t.shape()[d]); fwrite(&dim, sizeof(dim), 1, fp); }
+        fwrite(name.data(), 1, len, fp);
+        fwrite(t.data(), sizeof(float), t.numel(), fp);
+        fclose(fp);
+    }
+    return true;
+}
+
+// ── Atomic: vae_decode ──
+// final_latents → sd_image; outputs via images_out
+static sd_image_t* run_vae_decode(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* params, GenerationRequest& request, int* num_images_out) {
+    std::string diffuse_out = SAFE_STR(params->diffuse_out);
+    if (diffuse_out.empty()) { LOG_ERROR("vae_decode: --diffuse-out required"); return nullptr; }
+
+    std::vector<sd::Tensor<float>> final_latents;
+    for (int i = 0;; i++) {
+        std::string path = diffuse_out + "/final_" + std::to_string(i) + ".bin";
+        FILE* fp = fopen(path.c_str(), "rb");
+        if (!fp) break;
+        int32_t n_dims = 0, len = 0, ttype = 0;
+        if (fread(&n_dims, sizeof(n_dims), 1, fp) != 1) { fclose(fp); break; }
+        if (fread(&len, sizeof(len), 1, fp) != 1) { fclose(fp); break; }
+        if (fread(&ttype, sizeof(ttype), 1, fp) != 1) { fclose(fp); break; }
+        std::vector<int64_t> shape(n_dims, 1);
+        for (int d = 0; d < n_dims; d++) {
+            int32_t dim = 0;
+            if (fread(&dim, sizeof(dim), 1, fp) != 1) { fclose(fp); break; }
+            shape[d] = dim;
+        }
+        if (len > 0 && fseek(fp, len, SEEK_CUR) != 0) { fclose(fp); break; }
+        sd::Tensor<float> tensor(shape);
+        if (fread(tensor.data(), sizeof(float), tensor.numel(), fp) != static_cast<size_t>(tensor.numel())) { fclose(fp); break; }
+        fclose(fp);
+        final_latents.push_back(std::move(tensor));
+    }
+
+    if (final_latents.empty()) {
+        LOG_ERROR("vae_decode: no cached final latents found in '%s'", diffuse_out.c_str());
+        return nullptr;
+    }
+    LOG_INFO("vae_decode: loaded %zu final latents, decoding", final_latents.size());
+
+    int num_images = 0;
+    auto result = decode_image_outputs(sd_ctx, request, final_latents, &num_images);
+    if (num_images_out) *num_images_out = num_images;
+    return result;
+}
+
 SD_API bool generate_image(sd_ctx_t* sd_ctx,
                            const sd_img_gen_params_t* sd_img_gen_params,
                            sd_image_t** images_out,
@@ -4974,21 +5532,75 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
 
     ImageVaeAxesGuard axes_guard(sd_ctx, sd_img_gen_params, request);
 
+    const char* stage_cstr = sd_img_gen_params->stage;
+    std::vector<std::string> stages;
+    if (stage_cstr != nullptr && strlen(stage_cstr) > 0) {
+        std::string s(stage_cstr);
+        size_t pos = 0;
+        while ((pos = s.find(',')) != std::string::npos) {
+            std::string tok = s.substr(0, pos);
+            if (!tok.empty()) stages.push_back(tok);
+            s.erase(0, pos + 1);
+        }
+        if (!s.empty()) stages.push_back(s);
+    }
+
+    if (!stages.empty()) {
+        if (stages.size() > 1) {
+            LOG_ERROR("atomic stages must be invoked one at a time; run each --stage in a separate process and pass cache dirs as inputs/outputs");
+            return false;
+        }
+
+        // Atomic stages execute exactly one step per process.
+        SamplePlan plan(sd_ctx, sd_img_gen_params, request);
+        const std::string& s = stages[0];
+        LOG_INFO("Stage: %s", s.c_str());
+
+        if (s == "llm_encode_vision") {
+            if (!run_llm_encode_vision(sd_ctx, sd_img_gen_params)) return false;
+        } else if (s == "llm_encode_text") {
+            if (!run_llm_encode_text(sd_ctx, sd_img_gen_params)) return false;
+        } else if (s == "vae_encode") {
+            if (!run_vae_encode(sd_ctx, sd_img_gen_params)) return false;
+        } else if (s == "diffuse") {
+            if (!run_diffuse(sd_ctx, sd_img_gen_params, request, plan)) return false;
+        } else if (s == "vae_decode") {
+            int num_images = 0;
+            auto result = run_vae_decode(sd_ctx, sd_img_gen_params, request, &num_images);
+            if (result == nullptr) return false;
+            sd_ctx->sd->lora_stat();
+            int64_t t1 = ggml_time_ms();
+            LOG_INFO("vae_decode completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+            if (num_images_out != nullptr) { *num_images_out = num_images; }
+            if (images_out != nullptr) { *images_out = result; } else { free_sd_images(result, num_images); }
+        } else {
+            LOG_ERROR("Unknown stage: '%s'", s.c_str());
+            return false;
+        }
+
+        if (s != "vae_decode") {
+            if (num_images_out != nullptr) *num_images_out = 0;
+            if (images_out != nullptr) *images_out = nullptr;
+        }
+        return true;
+    }
+
+    // ── No stage specified: original full pipeline ──
     SamplePlan plan(sd_ctx, sd_img_gen_params, request);
     auto latents_opt = prepare_image_generation_latents(sd_ctx,
-                                                        sd_img_gen_params,
-                                                        &request,
-                                                        &plan);
+                                                         sd_img_gen_params,
+                                                         &request,
+                                                         &plan);
     if (!latents_opt.has_value()) {
         return false;
     }
     ImageGenerationLatents latents = std::move(*latents_opt);
 
     auto embeds_opt = prepare_image_generation_embeds(sd_ctx,
-                                                      sd_img_gen_params,
-                                                      &request,
-                                                      &plan,
-                                                      &latents);
+                                                       sd_img_gen_params,
+                                                       &request,
+                                                       &plan,
+                                                       &latents);
     if (!embeds_opt.has_value()) {
         return false;
     }
@@ -5133,8 +5745,8 @@ SD_API bool generate_image(sd_ctx_t* sd_ctx,
                 mask_shape[0]                   = upscaled.shape()[0];
                 mask_shape[1]                   = upscaled.shape()[1];
                 hires_denoise_mask              = sd::ops::interpolate(latents.denoise_mask,
-                                                                       mask_shape,
-                                                                       sd::ops::InterpolateMode::NearestMax);
+                                                                        mask_shape,
+                                                                        sd::ops::InterpolateMode::NearestMax);
             }
 
             int64_t hires_sample_start = ggml_time_ms();

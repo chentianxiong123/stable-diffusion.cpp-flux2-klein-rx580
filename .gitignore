@@ -1,15 +1,63 @@
+# Build output
 build*/
 cmake-build-*/
-test/
+out/
+dist/
+release/
+
+# IDE / local cache
 .vscode/
 .idea/
 .cache/
 *.swp
-*.bat
-*.bin
+__pycache__/
+*.pyc
+
+# Binaries and generated artifacts
 *.exe
-*.gguf
-output*.png
-models*
+*.dll
+*.lib
+*.pdb
+*.obj
+*.bin
 *.log
-preview.png
+
+# Model weights and local model folders
+*.gguf
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+models*/
+loras*/
+
+# All image/media files must stay out of the repo.
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.avif
+*.heic
+*.ico
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Local project inputs/outputs
+project/picture/
+project/runs/
+project/output/
+project/ref/
+project/prompts.txt
+
+# Temporary local scripts / old outputs
+tmp_*
+output*
+preview.*
+work_flux2/
